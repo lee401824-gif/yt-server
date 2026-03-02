@@ -1,0 +1,12 @@
+[
+  { "name": "영화", "keywords": ["영화리뷰", "시간순삭"], "maxVideos": 30 },
+  { "name": "드라마", "keywords": ["드라마몰아보기", "시간순삭"], "maxVideos": 30 },
+  { "name": "애니", "keywords": ["애니몰아보기", "시간순삭"], "maxVideos": 30 },
+  { "name": "공중파예능", "keywords": ["깔깔티비", "MBCentertainment"], "maxVideos": 30 },
+  { "name": "유투버예능", "keywords": ["웹예능"], "maxVideos": 30 },
+  { "name": "방송의적", "keywords": ["방송의적"], "maxVideos": 30 },
+  { "name": "음악의신", "keywords": ["음악의신"], "maxVideos": 30 },
+  { "name": "하이킥", "keywords": ["짧은다리", "지붕뚫고"], "maxVideos": 30 },
+  { "name": "음악", "keywords": ["최신팝", "최신음악"], "maxVideos": 30 },
+  { "name": "컬투쇼", "keywords": ["재훍"], "maxVideos": 30 }
+]
