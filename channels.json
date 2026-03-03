@@ -4,5 +4,5 @@
   { "name": "애니", "keywords": ["애니몰아보기", "시간순삭"], "maxVideos": 100 },
   { "name": "공중파예능", "keywords": ["깔깔티비", "MBCentertainment"], "maxVideos": 100 },
   { "name": "유투버예능", "keywords": ["웹예능"], "maxVideos": 100 },
-  { "name": "하이킥", "keywords": ["짧은다리", "지붕뚫고"], "maxVideos": 100 },
+  { "name": "하이킥", "keywords": ["짧은다리", "지붕뚫고"], "maxVideos": 100 }
 ]
