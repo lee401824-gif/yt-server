@@ -244,6 +244,21 @@ async function buildScheduleOncePerDay() {
 // 라우트
 // ----------------------------
 app.get("/", (req, res) => res.send("OK"));
+app.get("/daykey", (req, res) => {
+  try {
+    const cached = readJson(CACHE_FILE, null);
+
+    // cache.json이 있고 dayKey가 있으면 그걸 우선 반환(서버 기준)
+    if (cached?.dayKey) {
+      return res.json({ dayKey: cached.dayKey, updatedAt: cached.updatedAt ?? null });
+    }
+
+    // cache.json이 없으면 오늘 날짜키를 반환
+    return res.json({ dayKey: todayKey(), updatedAt: null });
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
+});
 
 app.get("/channels", async (req, res) => {
   try {
