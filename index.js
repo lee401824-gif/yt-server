@@ -2,7 +2,7 @@ import express from "express";
 import fetch from "node-fetch";
 import "dotenv/config";
 import fs from "fs";
-import crypto from "crypto";
+import { Redis } from "@upstash/redis";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,6 +11,9 @@ const PORT = process.env.PORT || 3000;
 // 필수 환경변수
 // ----------------------------
 const YT_API_KEY = process.env.YT_API_KEY;
+
+// Upstash Redis (서버 밖 저장소)
+const redis = Redis.fromEnv();
 
 // ----------------------------
 // 정책
@@ -24,8 +27,10 @@ const MAX_CHANNELS = 10;
 const DEDUPE_DAYS = 3;
 
 const CHANNELS_FILE = "./channels.json";
-const CACHE_FILE = "./cache.json";
-const HISTORY_FILE = "./history.json";
+
+// Redis 키
+const CACHE_KEY = "tvapp:daily-cache";
+const HISTORY_KEY = "tvapp:history";
 
 // ----------------------------
 // 유틸
@@ -35,19 +40,6 @@ function readJson(path, fallback) {
     return JSON.parse(fs.readFileSync(path, "utf-8"));
   } catch {
     return fallback;
-  }
-}
-
-function writeJson(path, data) {
-  fs.writeFileSync(path, JSON.stringify(data, null, 2), "utf-8");
-}
-
-function getChannelsConfigHash() {
-  try {
-    const raw = fs.readFileSync(CHANNELS_FILE, "utf-8");
-    return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
-  } catch {
-    return null;
   }
 }
 
@@ -96,15 +88,27 @@ function getPerKeywordTarget(keywordCount) {
   return 100;
 }
 
+async function getCache() {
+  const data = await redis.get(CACHE_KEY);
+  return data || null;
+}
+
+async function setCache(payload) {
+  await redis.set(CACHE_KEY, payload);
+}
+
+async function getHistory() {
+  const data = await redis.get(HISTORY_KEY);
+  return data || {};
+}
+
+async function setHistory(history) {
+  await redis.set(HISTORY_KEY, history);
+}
+
 // ----------------------------
 // YouTube API
 // ----------------------------
-// keywordPhrase 예:
-// "영화리뷰 시간순삭"
-// "애니리뷰 결말포함"
-// "최신팝"
-//
-// 이 문자열을 그대로 자연어 검색으로 보냄
 async function searchVideoIdsByPhrase(keywordPhrase, wantCount) {
   const q = String(keywordPhrase || "").trim();
   if (!q) return [];
@@ -127,6 +131,10 @@ async function searchVideoIdsByPhrase(keywordPhrase, wantCount) {
 
     const r = await fetch(url);
     const j = await r.json();
+
+    if (!r.ok) {
+      throw new Error(`YouTube search.list failed: ${JSON.stringify(j)}`);
+    }
 
     const ids = (j.items || [])
       .map((it) => it.id?.videoId)
@@ -159,6 +167,10 @@ async function fetchVideoDetails(videoIds) {
 
     const r = await fetch(url);
     const j = await r.json();
+
+    if (!r.ok) {
+      throw new Error(`YouTube videos.list failed: ${JSON.stringify(j)}`);
+    }
 
     const mapped = (j.items || []).map((it) => {
       const durationSec = isoDurationToSeconds(it.contentDetails?.duration);
@@ -194,30 +206,23 @@ async function buildOneChannel(ch, seenIdsSet) {
   const keywordCount = keywords.length;
   const perKeywordTarget = getPerKeywordTarget(keywordCount);
 
-  // 키워드별 검색
   let collectedIds = [];
   for (const keywordPhrase of keywords) {
     const ids = await searchVideoIdsByPhrase(keywordPhrase, perKeywordTarget);
     collectedIds.push(...ids);
   }
 
-  // 채널 내부 중복 제거
   const uniqueIds = [...new Set(collectedIds)];
-
-  // 상세 조회
   const details = await fetchVideoDetails(uniqueIds);
 
-  // 필터
   let candidates = details.filter((v) => (v.durationSec || 0) >= MIN_DURATION_SEC);
 
   if (EXCLUDE_LIVE) {
     candidates = candidates.filter((v) => v.liveBroadcastContent === "none");
   }
 
-  // 최신순 정렬
   candidates.sort((a, b) => String(b.publishedAt).localeCompare(String(a.publishedAt)));
 
-  // 최근 3일 중복 최대한 회피
   const fresh = candidates.filter((v) => !seenIdsSet.has(v.videoId));
   const fallback = candidates.filter((v) => seenIdsSet.has(v.videoId));
 
@@ -244,11 +249,11 @@ async function buildOneChannel(ch, seenIdsSet) {
   };
 }
 
-async function buildSchedule(configHash) {
+async function buildSchedule() {
   const channelsConfig = readJson(CHANNELS_FILE, []);
   const pickedConfig = (Array.isArray(channelsConfig) ? channelsConfig : []).slice(0, MAX_CHANNELS);
 
-  const history = readJson(HISTORY_FILE, {});
+  const history = await getHistory();
   const keys = recentDayKeys(DEDUPE_DAYS);
 
   const seenIds = new Set();
@@ -273,7 +278,6 @@ async function buildSchedule(configHash) {
   const payload = {
     updatedAt: new Date().toISOString(),
     dayKey: todayKey(),
-    configHash,
     channelCount: channels.length,
     channels,
   };
@@ -294,7 +298,7 @@ async function buildSchedule(configHash) {
     delete history[allDays[i]];
   }
 
-  writeJson(HISTORY_FILE, history);
+  await setHistory(history);
 
   return payload;
 }
@@ -306,9 +310,10 @@ app.get("/", (req, res) => {
   res.send("OK");
 });
 
-app.get("/daykey", (req, res) => {
+app.get("/daykey", async (req, res) => {
   try {
-    const cached = readJson(CACHE_FILE, null);
+    const cached = await getCache();
+
     return res.json({
       today: todayKey(),
       cachedDayKey: cached?.dayKey ?? null,
@@ -328,21 +333,21 @@ app.get("/channels", async (req, res) => {
       });
     }
 
-    const currentHash = getChannelsConfigHash();
-    const cached = readJson(CACHE_FILE, null);
+    // ✅ 오늘 캐시가 있으면 무조건 그걸 사용
+    // channels.json을 오늘 바꿔도 날짜가 바뀌기 전까지는 기존 재생목록 유지
+    const cached = await getCache();
 
     if (
       cached?.dayKey === todayKey() &&
       Array.isArray(cached?.channels) &&
-      cached.channels.length > 0 &&
-      currentHash &&
-      cached.configHash === currentHash
+      cached.channels.length > 0
     ) {
       return res.json({ ...cached, cached: true });
     }
 
-    const fresh = await buildSchedule(currentHash);
-    writeJson(CACHE_FILE, fresh);
+    // 오늘 캐시가 없을 때만 새로 생성
+    const fresh = await buildSchedule();
+    await setCache(fresh);
 
     return res.json({ ...fresh, cached: false });
   } catch (e) {
