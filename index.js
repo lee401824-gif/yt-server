@@ -11,8 +11,6 @@ const PORT = process.env.PORT || 3000;
 // 필수 환경변수
 // ----------------------------
 const YT_API_KEY = process.env.YT_API_KEY;
-
-// Upstash Redis (서버 밖 저장소)
 const redis = Redis.fromEnv();
 
 // ----------------------------
@@ -31,6 +29,18 @@ const CHANNELS_FILE = "./channels.json";
 // Redis 키
 const CACHE_KEY = "tvapp:daily-cache";
 const HISTORY_KEY = "tvapp:history";
+const BUILD_LOCK_KEY = "tvapp:build-lock";
+
+// 쿼터 관리
+const DAILY_QUOTA_LIMIT = 10000;
+const DAILY_QUOTA_SAFE_LIMIT = 9000; // 안전하게 9000까지만 우리 서버가 쓰도록 제한
+const SEARCH_COST = 100;
+const VIDEOS_COST = 1;
+
+// 락 / 대기
+const BUILD_LOCK_TTL_SEC = 300; // 5분
+const WAIT_FOR_CACHE_MS = 60000; // 최대 60초 기다림
+const WAIT_POLL_MS = 2000; // 2초마다 확인
 
 // ----------------------------
 // 유틸
@@ -82,12 +92,19 @@ function chunkArray(arr, size) {
   return out;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function getPerKeywordTarget(keywordCount) {
   if (keywordCount <= 1) return 300;
   if (keywordCount === 2) return 150;
   return 100;
 }
 
+// ----------------------------
+// Redis helpers
+// ----------------------------
 async function getCache() {
   const data = await redis.get(CACHE_KEY);
   return data || null;
@@ -106,6 +123,59 @@ async function setHistory(history) {
   await redis.set(HISTORY_KEY, history);
 }
 
+function getQuotaKey(dayKey) {
+  return `tvapp:quota:${dayKey}`;
+}
+
+async function getQuotaUsed(dayKey) {
+  const value = await redis.get(getQuotaKey(dayKey));
+  return Number(value || 0);
+}
+
+async function addQuotaUsed(dayKey, amount) {
+  const key = getQuotaKey(dayKey);
+  const next = await redis.incrby(key, amount);
+
+  // 대충 3일 유지
+  await redis.expire(key, 60 * 60 * 24 * 3);
+
+  return Number(next);
+}
+
+async function tryAcquireBuildLock() {
+  const result = await redis.set(BUILD_LOCK_KEY, "1", {
+    nx: true,
+    ex: BUILD_LOCK_TTL_SEC,
+  });
+
+  return result === "OK";
+}
+
+async function releaseBuildLock() {
+  await redis.del(BUILD_LOCK_KEY);
+}
+
+async function isBuildLocked() {
+  const value = await redis.get(BUILD_LOCK_KEY);
+  return value !== null;
+}
+
+// ----------------------------
+// 쿼터 보호
+// ----------------------------
+async function ensureQuotaAvailable(cost) {
+  const day = todayKey();
+  const used = await getQuotaUsed(day);
+
+  if (used + cost > DAILY_QUOTA_SAFE_LIMIT) {
+    throw new Error(
+      `Quota guard blocked request. used=${used}, nextCost=${cost}, safeLimit=${DAILY_QUOTA_SAFE_LIMIT}, hardLimit=${DAILY_QUOTA_LIMIT}`
+    );
+  }
+
+  await addQuotaUsed(day, cost);
+}
+
 // ----------------------------
 // YouTube API
 // ----------------------------
@@ -119,6 +189,9 @@ async function searchVideoIdsByPhrase(keywordPhrase, wantCount) {
 
   while (remaining > 0) {
     const batchSize = Math.min(50, remaining);
+
+    // ✅ search.list 비용 100
+    await ensureQuotaAvailable(SEARCH_COST);
 
     const url =
       `https://www.googleapis.com/youtube/v3/search?` +
@@ -160,6 +233,9 @@ async function fetchVideoDetails(videoIds) {
   const all = [];
 
   for (const ids of chunks) {
+    // ✅ videos.list 비용 1
+    await ensureQuotaAvailable(VIDEOS_COST);
+
     const url =
       `https://www.googleapis.com/youtube/v3/videos?` +
       `part=contentDetails,snippet&id=${ids.join(",")}` +
@@ -174,7 +250,7 @@ async function fetchVideoDetails(videoIds) {
 
     const mapped = (j.items || []).map((it) => {
       const durationSec = isoDurationToSeconds(it.contentDetails?.duration);
-      const live = it.snippet?.liveBroadcastContent; // live | upcoming | none
+      const live = it.snippet?.liveBroadcastContent;
 
       return {
         videoId: it.id,
@@ -279,10 +355,10 @@ async function buildSchedule() {
     updatedAt: new Date().toISOString(),
     dayKey: todayKey(),
     channelCount: channels.length,
+    quotaUsedByServerToday: await getQuotaUsed(todayKey()),
     channels,
   };
 
-  // 오늘 사용한 videoId 기록
   const today = todayKey();
   history[today] = history[today] || {};
 
@@ -290,7 +366,6 @@ async function buildSchedule() {
     history[today][ch.name] = (ch.videos || []).map((v) => v.videoId).filter(Boolean);
   }
 
-  // 최근 30일만 유지
   const keepDays = 30;
   const allDays = Object.keys(history).sort();
   const cutoffIndex = Math.max(0, allDays.length - keepDays);
@@ -304,6 +379,35 @@ async function buildSchedule() {
 }
 
 // ----------------------------
+// 중복 생성 방지
+// ----------------------------
+async function waitForExistingBuildResult() {
+  const start = Date.now();
+
+  while (Date.now() - start < WAIT_FOR_CACHE_MS) {
+    const cached = await getCache();
+
+    if (
+      cached?.dayKey === todayKey() &&
+      Array.isArray(cached?.channels) &&
+      cached.channels.length > 0
+    ) {
+      return cached;
+    }
+
+    const locked = await isBuildLocked();
+    if (!locked) {
+      // 락이 풀렸는데 캐시가 없으면 다시 상위 로직이 생성 시도하게 null 반환
+      return null;
+    }
+
+    await sleep(WAIT_POLL_MS);
+  }
+
+  return null;
+}
+
+// ----------------------------
 // 라우트
 // ----------------------------
 app.get("/", (req, res) => {
@@ -313,12 +417,17 @@ app.get("/", (req, res) => {
 app.get("/daykey", async (req, res) => {
   try {
     const cached = await getCache();
+    const quotaUsed = await getQuotaUsed(todayKey());
 
     return res.json({
       today: todayKey(),
       cachedDayKey: cached?.dayKey ?? null,
       hasTodayCache: cached?.dayKey === todayKey(),
       hasChannels: Array.isArray(cached?.channels) && cached.channels.length > 0,
+      quotaUsedByServerToday: quotaUsed,
+      quotaSafeLimit: DAILY_QUOTA_SAFE_LIMIT,
+      quotaHardLimit: DAILY_QUOTA_LIMIT,
+      buildLocked: await isBuildLocked(),
     });
   } catch (e) {
     return res.status(500).json({ error: String(e) });
@@ -333,10 +442,8 @@ app.get("/channels", async (req, res) => {
       });
     }
 
-    // ✅ 오늘 캐시가 있으면 무조건 그걸 사용
-    // channels.json을 오늘 바꿔도 날짜가 바뀌기 전까지는 기존 재생목록 유지
+    // 1) 오늘 캐시가 있으면 무조건 사용
     const cached = await getCache();
-
     if (
       cached?.dayKey === todayKey() &&
       Array.isArray(cached?.channels) &&
@@ -345,11 +452,51 @@ app.get("/channels", async (req, res) => {
       return res.json({ ...cached, cached: true });
     }
 
-    // 오늘 캐시가 없을 때만 새로 생성
-    const fresh = await buildSchedule();
-    await setCache(fresh);
+    // 2) 누군가 이미 생성 중이면 기다렸다가 그 결과를 받음
+    const locked = await isBuildLocked();
+    if (locked) {
+      const waited = await waitForExistingBuildResult();
 
-    return res.json({ ...fresh, cached: false });
+      if (
+        waited?.dayKey === todayKey() &&
+        Array.isArray(waited?.channels) &&
+        waited.channels.length > 0
+      ) {
+        return res.json({ ...waited, cached: true, waitedForBuild: true });
+      }
+
+      return res.status(503).json({
+        error: "Schedule is being built. Please try again shortly.",
+      });
+    }
+
+    // 3) 락 획득 시도
+    const acquired = await tryAcquireBuildLock();
+    if (!acquired) {
+      const waited = await waitForExistingBuildResult();
+
+      if (
+        waited?.dayKey === todayKey() &&
+        Array.isArray(waited?.channels) &&
+        waited.channels.length > 0
+      ) {
+        return res.json({ ...waited, cached: true, waitedForBuild: true });
+      }
+
+      return res.status(503).json({
+        error: "Schedule build lock contention. Please try again shortly.",
+      });
+    }
+
+    try {
+      // 4) 오늘 캐시가 없을 때만 새로 생성
+      const fresh = await buildSchedule();
+      await setCache(fresh);
+
+      return res.json({ ...fresh, cached: false });
+    } finally {
+      await releaseBuildLock();
+    }
   } catch (e) {
     return res.status(500).json({ error: String(e) });
   }
