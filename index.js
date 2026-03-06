@@ -2,6 +2,7 @@ import express from "express";
 import fetch from "node-fetch";
 import "dotenv/config";
 import fs from "fs";
+import crypto from "crypto";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,27 +13,19 @@ const PORT = process.env.PORT || 3000;
 const YT_API_KEY = process.env.YT_API_KEY;
 
 // ----------------------------
-// 정책(원하면 여기만 바꾸면 됨)
+// 정책
 // ----------------------------
 const MIN_DURATION_SEC = 300; // 5분 이상만
-const EXCLUDE_LIVE = true; // 라이브/예정 제외
+const EXCLUDE_LIVE = true; // 라이브 / 예정 제외
 const REGION_CODE = "KR";
 const SAFE_SEARCH = "moderate";
 
-// 채널 최대 개수 (너는 10개)
 const MAX_CHANNELS = 10;
-
-// 검색 후보 개수(YouTube search는 최대 50)
-// 50으로 해도 되는데, "케이블예능/스포츠"처럼 결과가 적을 때를 위해 50 추천
-const SEARCH_CANDIDATES = 50;
-
-// "최근 N일" 중복 방지 (A = 3일)
 const DEDUPE_DAYS = 3;
 
-// 파일들
-const CHANNELS_FILE = "./channels.json"; // ✅ 채널/키워드 설정
-const CACHE_FILE = "./cache.json"; // 오늘 편성표 저장
-const HISTORY_FILE = "./history.json"; // 최근 사용 videoId 기록
+const CHANNELS_FILE = "./channels.json";
+const CACHE_FILE = "./cache.json";
+const HISTORY_FILE = "./history.json";
 
 // ----------------------------
 // 유틸
@@ -40,7 +33,7 @@ const HISTORY_FILE = "./history.json"; // 최근 사용 videoId 기록
 function readJson(path, fallback) {
   try {
     return JSON.parse(fs.readFileSync(path, "utf-8"));
-  } catch (e) {
+  } catch {
     return fallback;
   }
 }
@@ -49,7 +42,15 @@ function writeJson(path, data) {
   fs.writeFileSync(path, JSON.stringify(data, null, 2), "utf-8");
 }
 
-// ISO 8601 duration (PT#H#M#S) -> seconds
+function getChannelsConfigHash() {
+  try {
+    const raw = fs.readFileSync(CHANNELS_FILE, "utf-8");
+    return crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+  } catch {
+    return null;
+  }
+}
+
 function isoDurationToSeconds(iso) {
   if (!iso) return 0;
   const m = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
@@ -60,7 +61,6 @@ function isoDurationToSeconds(iso) {
   return h * 3600 + min * 60 + s;
 }
 
-// 오늘 날짜키(서버 기준) "YYYY-MM-DD"
 function todayKey() {
   const d = new Date();
   const yyyy = d.getFullYear();
@@ -69,7 +69,6 @@ function todayKey() {
   return `${yyyy}-${mm}-${dd}`;
 }
 
-// 최근 N일(어제부터 N일) 날짜키 배열
 function recentDayKeys(n) {
   const keys = [];
   for (let i = 1; i <= n; i++) {
@@ -83,87 +82,143 @@ function recentDayKeys(n) {
   return keys;
 }
 
+function chunkArray(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) {
+    out.push(arr.slice(i, i + size));
+  }
+  return out;
+}
+
+function getPerKeywordTarget(keywordCount) {
+  if (keywordCount <= 1) return 300;
+  if (keywordCount === 2) return 150;
+  return 100;
+}
+
 // ----------------------------
 // YouTube API
 // ----------------------------
-
-// search.list: 키워드들을 " "로 합쳐서 한 번에 검색 (max 50)
-async function searchVideoIdsByKeywords(keywords, wantCount) {
-  const q = (keywords || []).join(" ").trim();
+// keywordPhrase 예:
+// "영화리뷰 시간순삭"
+// "애니리뷰 결말포함"
+// "최신팝"
+//
+// 이 문자열을 그대로 자연어 검색으로 보냄
+async function searchVideoIdsByPhrase(keywordPhrase, wantCount) {
+  const q = String(keywordPhrase || "").trim();
   if (!q) return [];
 
-  const want = Math.min(Math.max(wantCount || 30, 1), 50);
+  let collected = [];
+  let nextPageToken = "";
+  let remaining = Math.max(0, wantCount);
 
-  const url =
-    `https://www.googleapis.com/youtube/v3/search?` +
-    `part=snippet&type=video&maxResults=${want}` +
-    `&q=${encodeURIComponent(q)}` +
-    `&regionCode=${REGION_CODE}` +
-    `&safeSearch=${SAFE_SEARCH}` +
-    `&key=${YT_API_KEY}`;
+  while (remaining > 0) {
+    const batchSize = Math.min(50, remaining);
 
-  const r = await fetch(url);
-  const j = await r.json();
+    const url =
+      `https://www.googleapis.com/youtube/v3/search?` +
+      `part=snippet&type=video&maxResults=${batchSize}` +
+      `&q=${encodeURIComponent(q)}` +
+      `&regionCode=${REGION_CODE}` +
+      `&safeSearch=${SAFE_SEARCH}` +
+      (nextPageToken ? `&pageToken=${encodeURIComponent(nextPageToken)}` : "") +
+      `&key=${YT_API_KEY}`;
 
-  const ids = (j.items || [])
-    .map((it) => it.id?.videoId)
-    .filter(Boolean);
+    const r = await fetch(url);
+    const j = await r.json();
 
-  return [...new Set(ids)];
+    const ids = (j.items || [])
+      .map((it) => it.id?.videoId)
+      .filter(Boolean);
+
+    collected.push(...ids);
+
+    nextPageToken = j.nextPageToken || "";
+    remaining -= ids.length;
+
+    if (!nextPageToken || ids.length === 0) {
+      break;
+    }
+  }
+
+  return [...new Set(collected)];
 }
 
-// videos.list: 길이/라이브 여부 포함 상세 (최대 50개 묶어서)
 async function fetchVideoDetails(videoIds) {
   if (!videoIds.length) return [];
 
-  const url =
-    `https://www.googleapis.com/youtube/v3/videos?` +
-    `part=contentDetails,snippet&id=${videoIds.join(",")}` +
-    `&key=${YT_API_KEY}`;
+  const chunks = chunkArray(videoIds, 50);
+  const all = [];
 
-  const r = await fetch(url);
-  const j = await r.json();
+  for (const ids of chunks) {
+    const url =
+      `https://www.googleapis.com/youtube/v3/videos?` +
+      `part=contentDetails,snippet&id=${ids.join(",")}` +
+      `&key=${YT_API_KEY}`;
 
-  return (j.items || []).map((it) => {
-    const durationSec = isoDurationToSeconds(it.contentDetails?.duration);
-    const live = it.snippet?.liveBroadcastContent; // "live" | "upcoming" | "none"
+    const r = await fetch(url);
+    const j = await r.json();
 
-    return {
-      videoId: it.id,
-      title: it.snippet?.title,
-      thumb: it.snippet?.thumbnails?.medium?.url,
-      publishedAt: it.snippet?.publishedAt,
-      durationSec,
-      liveBroadcastContent: live,
-    };
-  });
+    const mapped = (j.items || []).map((it) => {
+      const durationSec = isoDurationToSeconds(it.contentDetails?.duration);
+      const live = it.snippet?.liveBroadcastContent; // live | upcoming | none
+
+      return {
+        videoId: it.id,
+        title: it.snippet?.title,
+        thumb: it.snippet?.thumbnails?.medium?.url,
+        publishedAt: it.snippet?.publishedAt,
+        durationSec,
+        liveBroadcastContent: live,
+      };
+    });
+
+    all.push(...mapped);
+  }
+
+  return all;
 }
 
-// 한 채널 만들기 (✅ 최근 3일 중복 방지 포함)
+// ----------------------------
+// 채널 빌드
+// ----------------------------
 async function buildOneChannel(ch, seenIdsSet) {
   const name = ch?.name || "채널";
-  const keywords = Array.isArray(ch?.keywords) ? ch.keywords : [];
-  const maxVideos = typeof ch?.maxVideos === "number" ? ch.maxVideos : 30;
+  const keywords = Array.isArray(ch?.keywords)
+    ? ch.keywords.map((k) => String(k).trim()).filter(Boolean)
+    : [];
 
-  // 후보는 SEARCH_CANDIDATES(최대 50)
-  const ids = await searchVideoIdsByKeywords(keywords, SEARCH_CANDIDATES);
-  const details = await fetchVideoDetails(ids);
+  const maxVideos = typeof ch?.maxVideos === "number" ? ch.maxVideos : 100;
 
-  // 1) 5분 이상
+  const keywordCount = keywords.length;
+  const perKeywordTarget = getPerKeywordTarget(keywordCount);
+
+  // 키워드별 검색
+  let collectedIds = [];
+  for (const keywordPhrase of keywords) {
+    const ids = await searchVideoIdsByPhrase(keywordPhrase, perKeywordTarget);
+    collectedIds.push(...ids);
+  }
+
+  // 채널 내부 중복 제거
+  const uniqueIds = [...new Set(collectedIds)];
+
+  // 상세 조회
+  const details = await fetchVideoDetails(uniqueIds);
+
+  // 필터
   let candidates = details.filter((v) => (v.durationSec || 0) >= MIN_DURATION_SEC);
 
-  // 2) 라이브/예정 제외
   if (EXCLUDE_LIVE) {
     candidates = candidates.filter((v) => v.liveBroadcastContent === "none");
   }
 
-  // 3) 최신순
+  // 최신순 정렬
   candidates.sort((a, b) => String(b.publishedAt).localeCompare(String(a.publishedAt)));
 
-  // ✅ 4) 최근 3일에 나온 적 없는 영상 먼저
+  // 최근 3일 중복 최대한 회피
   const fresh = candidates.filter((v) => !seenIdsSet.has(v.videoId));
-
-  // ✅ 5) 부족하면 겹치는 영상으로 채움
   const fallback = candidates.filter((v) => seenIdsSet.has(v.videoId));
 
   let picked = fresh.slice(0, maxVideos);
@@ -175,6 +230,10 @@ async function buildOneChannel(ch, seenIdsSet) {
   return {
     name,
     keywords,
+    requestedPerKeyword: perKeywordTarget,
+    requestedTotalCandidates: perKeywordTarget * keywordCount,
+    uniqueCandidateCount: uniqueIds.length,
+    finalVideoCount: picked.length,
     videos: picked.map((v) => ({
       videoId: v.videoId,
       title: v.title,
@@ -185,12 +244,10 @@ async function buildOneChannel(ch, seenIdsSet) {
   };
 }
 
-// 전체 편성표 만들기(하루 1번) + history 기록
-async function buildScheduleOncePerDay() {
+async function buildSchedule(configHash) {
   const channelsConfig = readJson(CHANNELS_FILE, []);
   const pickedConfig = (Array.isArray(channelsConfig) ? channelsConfig : []).slice(0, MAX_CHANNELS);
 
-  // ✅ 최근 3일 history에서 seen videoIds 모으기
   const history = readJson(HISTORY_FILE, {});
   const keys = recentDayKeys(DEDUPE_DAYS);
 
@@ -207,19 +264,21 @@ async function buildScheduleOncePerDay() {
     }
   }
 
-  // ✅ 채널 만들기
   const channels = [];
   for (const ch of pickedConfig) {
-    channels.push(await buildOneChannel(ch, seenIds));
+    const built = await buildOneChannel(ch, seenIds);
+    channels.push(built);
   }
 
   const payload = {
     updatedAt: new Date().toISOString(),
     dayKey: todayKey(),
+    configHash,
+    channelCount: channels.length,
     channels,
   };
 
-  // ✅ 오늘 사용한 videoId를 history에 기록
+  // 오늘 사용한 videoId 기록
   const today = todayKey();
   history[today] = history[today] || {};
 
@@ -227,7 +286,7 @@ async function buildScheduleOncePerDay() {
     history[today][ch.name] = (ch.videos || []).map((v) => v.videoId).filter(Boolean);
   }
 
-  // ✅ history가 너무 커지는 걸 방지: 최근 30일만 유지
+  // 최근 30일만 유지
   const keepDays = 30;
   const allDays = Object.keys(history).sort();
   const cutoffIndex = Math.max(0, allDays.length - keepDays);
@@ -243,18 +302,19 @@ async function buildScheduleOncePerDay() {
 // ----------------------------
 // 라우트
 // ----------------------------
-app.get("/", (req, res) => res.send("OK"));
+app.get("/", (req, res) => {
+  res.send("OK");
+});
+
 app.get("/daykey", (req, res) => {
   try {
     const cached = readJson(CACHE_FILE, null);
-
-    // cache.json이 있고 dayKey가 있으면 그걸 우선 반환(서버 기준)
-    if (cached?.dayKey) {
-      return res.json({ dayKey: cached.dayKey, updatedAt: cached.updatedAt ?? null });
-    }
-
-    // cache.json이 없으면 오늘 날짜키를 반환
-    return res.json({ dayKey: todayKey(), updatedAt: null });
+    return res.json({
+      today: todayKey(),
+      cachedDayKey: cached?.dayKey ?? null,
+      hasTodayCache: cached?.dayKey === todayKey(),
+      hasChannels: Array.isArray(cached?.channels) && cached.channels.length > 0,
+    });
   } catch (e) {
     return res.status(500).json({ error: String(e) });
   }
@@ -263,17 +323,25 @@ app.get("/daykey", (req, res) => {
 app.get("/channels", async (req, res) => {
   try {
     if (!YT_API_KEY) {
-      return res.status(500).json({ error: "YT_API_KEY is not set (.env 확인)" });
+      return res.status(500).json({
+        error: "YT_API_KEY is not set (Render Environment 확인)",
+      });
     }
 
-    // 1) 오늘 캐시가 있으면 그대로 반환
+    const currentHash = getChannelsConfigHash();
     const cached = readJson(CACHE_FILE, null);
-    if (cached?.dayKey === todayKey() && Array.isArray(cached?.channels)) {
+
+    if (
+      cached?.dayKey === todayKey() &&
+      Array.isArray(cached?.channels) &&
+      cached.channels.length > 0 &&
+      currentHash &&
+      cached.configHash === currentHash
+    ) {
       return res.json({ ...cached, cached: true });
     }
 
-    // 2) 없으면 새로 만들고 저장(=오늘 1번만)
-    const fresh = await buildScheduleOncePerDay();
+    const fresh = await buildSchedule(currentHash);
     writeJson(CACHE_FILE, fresh);
 
     return res.json({ ...fresh, cached: false });
@@ -282,4 +350,6 @@ app.get("/channels", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server running on ${PORT}`);
+});

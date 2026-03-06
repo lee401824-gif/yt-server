@@ -1,8 +1,91 @@
 [
-  { "name": "영화", "keywords": ["영화리뷰", "시간순삭"], "maxVideos": 100 },
-  { "name": "드라마", "keywords": ["드라마몰아보기", "시간순삭"], "maxVideos": 100 },
-  { "name": "애니", "keywords": ["애니몰아보기", "시간순삭"], "maxVideos": 100 },
-  { "name": "공중파예능", "keywords": ["깔깔티비", "MBCentertainment"], "maxVideos": 100 },
-  { "name": "유투버예능", "keywords": ["웹예능"], "maxVideos": 100 },
-  { "name": "하이킥", "keywords": ["짧은다리", "지붕뚫고"], "maxVideos": 100 }
+  {
+    "name": "영화",
+    "keywords": [
+      "영화리뷰 시간순삭",
+      "결말포함 영화",
+      "몰입감 영화"
+    ],
+    "maxVideos": 100
+  },
+  {
+    "name": "드라마",
+    "keywords": [
+      "드라마 시간순삭",
+      "드라마 몰아보기",
+      "시트콤"
+    ],
+    "maxVideos": 100
+  },
+  {
+    "name": "애니",
+    "keywords": [
+      "애니 시간순삭",
+      "애니 몰아보기",
+      "명작 애니"
+    ],
+    "maxVideos": 100
+  },
+  {
+    "name": "공중파예능",
+    "keywords": [
+      "MBC entertainment",
+      "KBS 예능 레전드",
+      "SBS 예능 모음"
+    ],
+    "maxVideos": 100
+  },
+  {
+    "name": "유튜버예능",
+    "keywords": [
+      "웹예능",
+      "유튜브 예능",
+      "유투버 예능"
+    ],
+    "maxVideos": 100
+  },
+  {
+    "name": "페이크다큐",
+    "keywords": [
+      "방송의적",
+      "uv 신드롬",
+      "음악의 신"
+    ],
+    "maxVideos": 100
+  },
+  {
+    "name": "코미디",
+    "keywords": [
+      "코미디",
+      "개그"
+    ],
+    "maxVideos": 100
+  },
+  {
+    "name": "하이킥",
+    "keywords": [
+      "지붕뚫고",
+  
+      "짧은다리"
+    ],
+    "maxVideos": 100
+  },
+  {
+    "name": "이상준",
+    "keywords": [
+      "상준아모하니",
+      "이상준의 노타이틀",
+      "이상준쇼"
+    ],
+    "maxVideos": 100
+  },
+  {
+    "name": "웃긴거",
+    "keywords": [
+      "유병재",
+      "빠더너스",
+      "재훍"
+    ],
+    "maxVideos": 100
+  }
 ]
