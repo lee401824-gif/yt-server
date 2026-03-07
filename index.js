@@ -33,13 +33,13 @@ const BUILD_LOCK_KEY = "tvapp:build-lock";
 
 // 쿼터 관리
 const DAILY_QUOTA_LIMIT = 10000;
-const DAILY_QUOTA_SAFE_LIMIT = 9000; // 안전하게 9000까지만 우리 서버가 쓰도록 제한
+const DAILY_QUOTA_SAFE_LIMIT = 9000; // 안전한 상한선
 const SEARCH_COST = 100;
 const VIDEOS_COST = 1;
 
 // 락 / 대기
 const BUILD_LOCK_TTL_SEC = 300; // 5분
-const WAIT_FOR_CACHE_MS = 60000; // 최대 60초 기다림
+const WAIT_FOR_CACHE_MS = 60000; // 최대 60초
 const WAIT_POLL_MS = 2000; // 2초마다 확인
 
 // ----------------------------
@@ -136,7 +136,7 @@ async function addQuotaUsed(dayKey, amount) {
   const key = getQuotaKey(dayKey);
   const next = await redis.incrby(key, amount);
 
-  // 대충 3일 유지
+  // 3일 정도 유지
   await redis.expire(key, 60 * 60 * 24 * 3);
 
   return Number(next);
@@ -190,7 +190,7 @@ async function searchVideoIdsByPhrase(keywordPhrase, wantCount) {
   while (remaining > 0) {
     const batchSize = Math.min(50, remaining);
 
-    // ✅ search.list 비용 100
+    // search.list 비용 100
     await ensureQuotaAvailable(SEARCH_COST);
 
     const url =
@@ -233,7 +233,7 @@ async function fetchVideoDetails(videoIds) {
   const all = [];
 
   for (const ids of chunks) {
-    // ✅ videos.list 비용 1
+    // videos.list 비용 1
     await ensureQuotaAvailable(VIDEOS_COST);
 
     const url =
@@ -269,6 +269,44 @@ async function fetchVideoDetails(videoIds) {
 }
 
 // ----------------------------
+// 새 재생목록 조립 규칙
+// ----------------------------
+// 기존 규칙:
+// fresh 먼저, 부족하면 fallback
+//
+// 새 규칙:
+// fallback(중복 영상) 먼저 유지
+// fresh(새 영상)는 맨 뒤에 붙임
+// fresh 개수만큼 fallback 맨 앞을 잘라냄
+//
+// 예)
+// maxVideos = 300
+// fallback = 300개
+// fresh = 40개
+// 결과 = fallback 뒤 260개 + fresh 40개
+//
+function mergeVideosWithTailFresh(fresh, fallback, maxVideos) {
+  const freshSelected = fresh.slice(0, maxVideos);
+
+  if (freshSelected.length >= maxVideos) {
+    // 새 영상만으로도 꽉 차면 그것만 사용
+    return freshSelected.slice(0, maxVideos);
+  }
+
+  // fallback은 최대 maxVideos만 먼저 확보
+  const fallbackBase = fallback.slice(0, maxVideos);
+
+  // fresh를 뒤에 붙이기 위해, 그 개수만큼 앞에서 잘라냄
+  const cutCount = freshSelected.length;
+  const fallbackTrimmed = fallbackBase.slice(cutCount);
+
+  const merged = [...fallbackTrimmed, ...freshSelected];
+
+  // 혹시 fallback이 부족하면 maxVideos보다 짧을 수 있음
+  return merged.slice(0, maxVideos);
+}
+
+// ----------------------------
 // 채널 빌드
 // ----------------------------
 async function buildOneChannel(ch, seenIdsSet) {
@@ -299,14 +337,13 @@ async function buildOneChannel(ch, seenIdsSet) {
 
   candidates.sort((a, b) => String(b.publishedAt).localeCompare(String(a.publishedAt)));
 
+  // 최근 3일에 없던 영상
   const fresh = candidates.filter((v) => !seenIdsSet.has(v.videoId));
+
+  // 최근 3일에 있던 영상
   const fallback = candidates.filter((v) => seenIdsSet.has(v.videoId));
 
-  let picked = fresh.slice(0, maxVideos);
-  if (picked.length < maxVideos) {
-    const need = maxVideos - picked.length;
-    picked = picked.concat(fallback.slice(0, need));
-  }
+  const picked = mergeVideosWithTailFresh(fresh, fallback, maxVideos);
 
   return {
     name,
@@ -314,6 +351,8 @@ async function buildOneChannel(ch, seenIdsSet) {
     requestedPerKeyword: perKeywordTarget,
     requestedTotalCandidates: perKeywordTarget * keywordCount,
     uniqueCandidateCount: uniqueIds.length,
+    freshCount: fresh.length,
+    fallbackCount: fallback.length,
     finalVideoCount: picked.length,
     videos: picked.map((v) => ({
       videoId: v.videoId,
@@ -359,6 +398,7 @@ async function buildSchedule() {
     channels,
   };
 
+  // 오늘 사용한 videoId 기록
   const today = todayKey();
   history[today] = history[today] || {};
 
@@ -366,6 +406,7 @@ async function buildSchedule() {
     history[today][ch.name] = (ch.videos || []).map((v) => v.videoId).filter(Boolean);
   }
 
+  // 최근 30일만 유지
   const keepDays = 30;
   const allDays = Object.keys(history).sort();
   const cutoffIndex = Math.max(0, allDays.length - keepDays);
@@ -397,7 +438,6 @@ async function waitForExistingBuildResult() {
 
     const locked = await isBuildLocked();
     if (!locked) {
-      // 락이 풀렸는데 캐시가 없으면 다시 상위 로직이 생성 시도하게 null 반환
       return null;
     }
 
@@ -452,7 +492,7 @@ app.get("/channels", async (req, res) => {
       return res.json({ ...cached, cached: true });
     }
 
-    // 2) 누군가 이미 생성 중이면 기다렸다가 그 결과를 받음
+    // 2) 이미 누군가 생성 중이면 기다림
     const locked = await isBuildLocked();
     if (locked) {
       const waited = await waitForExistingBuildResult();
@@ -470,7 +510,7 @@ app.get("/channels", async (req, res) => {
       });
     }
 
-    // 3) 락 획득 시도
+    // 3) 락 획득
     const acquired = await tryAcquireBuildLock();
     if (!acquired) {
       const waited = await waitForExistingBuildResult();
@@ -489,7 +529,7 @@ app.get("/channels", async (req, res) => {
     }
 
     try {
-      // 4) 오늘 캐시가 없을 때만 새로 생성
+      // 4) 오늘 캐시가 없을 때만 생성
       const fresh = await buildSchedule();
       await setCache(fresh);
 
