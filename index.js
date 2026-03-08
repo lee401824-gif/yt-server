@@ -111,6 +111,25 @@ function getPerKeywordTarget(keywordCount) {
   return 100;
 }
 
+// ----------------------------
+// 추가: 전체 키워드 개수 계산
+// ----------------------------
+function countTotalKeywords(channelsConfig) {
+  const pickedConfig = (Array.isArray(channelsConfig) ? channelsConfig : []).slice(0, MAX_CHANNELS);
+
+  let total = 0;
+
+  for (const ch of pickedConfig) {
+    const keywords = Array.isArray(ch?.keywords)
+      ? ch.keywords.map((k) => String(k).trim()).filter(Boolean)
+      : [];
+
+    total += keywords.length;
+  }
+
+  return total;
+}
+
 function hasUsableChannels(payload) {
   return (
     payload &&
@@ -199,6 +218,28 @@ async function ensureQuotaAvailable(cost) {
   }
 
   await addQuotaUsed(day, cost);
+}
+
+// ----------------------------
+// 추가: 빌드 시작 전 총 search 비용 선검사
+// 핵심 목적:
+// "조금 쓰고 중간 실패"를 막고
+// "부족하면 아예 시작 안 함"으로 바꾸기
+// ----------------------------
+async function ensureBuildQuotaAvailable() {
+  const channelsConfig = readJson(CHANNELS_FILE, []);
+  const totalKeywords = countTotalKeywords(channelsConfig);
+
+  const requiredSearchCost = totalKeywords * SEARCH_COST;
+
+  const day = todayKey();
+  const used = await getQuotaUsed(day);
+
+  if (used + requiredSearchCost > DAILY_QUOTA_SAFE_LIMIT) {
+    throw new Error(
+      `Build blocked before start. used=${used}, requiredSearchCost=${requiredSearchCost}, safeLimit=${DAILY_QUOTA_SAFE_LIMIT}, totalKeywords=${totalKeywords}, hardLimit=${DAILY_QUOTA_LIMIT}`
+    );
+  }
 }
 
 // ----------------------------
@@ -454,6 +495,14 @@ async function waitForExistingBuildResult() {
 }
 
 async function buildAndSaveOnlyIfUsable() {
+  // ----------------------------
+  // 추가된 핵심 보호막
+  // 재생목록 만들기 시작 전,
+  // 전체 키워드 기준 총 search 비용을 먼저 계산해서
+  // safe quota가 부족하면 아예 build를 시작하지 않음
+  // ----------------------------
+  await ensureBuildQuotaAvailable();
+
   const fresh = await buildSchedule();
 
   // 1순위: 기존 성공 캐시 보호
