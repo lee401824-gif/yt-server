@@ -2,6 +2,7 @@ import express from "express";
 import fetch from "node-fetch";
 import "dotenv/config";
 import fs from "fs";
+import cors from "cors";
 import { Redis } from "@upstash/redis";
 
 const app = express();
@@ -12,6 +13,13 @@ const PORT = process.env.PORT || 3000;
 // ----------------------------
 const YT_API_KEY = process.env.YT_API_KEY;
 const redis = Redis.fromEnv();
+
+// ----------------------------
+// CORS
+// ----------------------------
+// 지금은 PC 버전 포함해서 모두 허용
+// 나중에 필요하면 origin 제한 가능
+app.use(cors());
 
 // ----------------------------
 // 정책
@@ -27,13 +35,14 @@ const DEDUPE_DAYS = 3;
 const CHANNELS_FILE = "./channels.json";
 
 // Redis 키
-const CACHE_KEY = "tvapp:daily-cache";
+const TODAY_CACHE_KEY = "tvapp:daily-cache";
+const LAST_GOOD_CACHE_KEY = "tvapp:last-good-cache";
 const HISTORY_KEY = "tvapp:history";
 const BUILD_LOCK_KEY = "tvapp:build-lock";
 
 // 쿼터 관리
 const DAILY_QUOTA_LIMIT = 10000;
-const DAILY_QUOTA_SAFE_LIMIT = 9000; // 안전한 상한선
+const DAILY_QUOTA_SAFE_LIMIT = 9000;
 const SEARCH_COST = 100;
 const VIDEOS_COST = 1;
 
@@ -102,16 +111,36 @@ function getPerKeywordTarget(keywordCount) {
   return 100;
 }
 
+function hasUsableChannels(payload) {
+  return (
+    payload &&
+    Array.isArray(payload.channels) &&
+    payload.channels.length > 0 &&
+    payload.channels.some(
+      (ch) => Array.isArray(ch.videos) && ch.videos.length > 0
+    )
+  );
+}
+
 // ----------------------------
 // Redis helpers
 // ----------------------------
-async function getCache() {
-  const data = await redis.get(CACHE_KEY);
+async function getTodayCache() {
+  const data = await redis.get(TODAY_CACHE_KEY);
   return data || null;
 }
 
-async function setCache(payload) {
-  await redis.set(CACHE_KEY, payload);
+async function setTodayCache(payload) {
+  await redis.set(TODAY_CACHE_KEY, payload);
+}
+
+async function getLastGoodCache() {
+  const data = await redis.get(LAST_GOOD_CACHE_KEY);
+  return data || null;
+}
+
+async function setLastGoodCache(payload) {
+  await redis.set(LAST_GOOD_CACHE_KEY, payload);
 }
 
 async function getHistory() {
@@ -135,10 +164,7 @@ async function getQuotaUsed(dayKey) {
 async function addQuotaUsed(dayKey, amount) {
   const key = getQuotaKey(dayKey);
   const next = await redis.incrby(key, amount);
-
-  // 3일 정도 유지
   await redis.expire(key, 60 * 60 * 24 * 3);
-
   return Number(next);
 }
 
@@ -147,7 +173,6 @@ async function tryAcquireBuildLock() {
     nx: true,
     ex: BUILD_LOCK_TTL_SEC,
   });
-
   return result === "OK";
 }
 
@@ -190,7 +215,6 @@ async function searchVideoIdsByPhrase(keywordPhrase, wantCount) {
   while (remaining > 0) {
     const batchSize = Math.min(50, remaining);
 
-    // search.list 비용 100
     await ensureQuotaAvailable(SEARCH_COST);
 
     const url =
@@ -233,7 +257,6 @@ async function fetchVideoDetails(videoIds) {
   const all = [];
 
   for (const ids of chunks) {
-    // videos.list 비용 1
     await ensureQuotaAvailable(VIDEOS_COST);
 
     const url =
@@ -269,40 +292,23 @@ async function fetchVideoDetails(videoIds) {
 }
 
 // ----------------------------
-// 새 재생목록 조립 규칙
+// 재생목록 조립 규칙
 // ----------------------------
-// 기존 규칙:
-// fresh 먼저, 부족하면 fallback
-//
-// 새 규칙:
-// fallback(중복 영상) 먼저 유지
-// fresh(새 영상)는 맨 뒤에 붙임
-// fresh 개수만큼 fallback 맨 앞을 잘라냄
-//
-// 예)
-// maxVideos = 300
-// fallback = 300개
-// fresh = 40개
-// 결과 = fallback 뒤 260개 + fresh 40개
-//
+// fallback 먼저 유지
+// fresh는 맨 뒤에 붙임
+// fresh 개수만큼 fallback 앞부분 삭제
 function mergeVideosWithTailFresh(fresh, fallback, maxVideos) {
   const freshSelected = fresh.slice(0, maxVideos);
 
   if (freshSelected.length >= maxVideos) {
-    // 새 영상만으로도 꽉 차면 그것만 사용
     return freshSelected.slice(0, maxVideos);
   }
 
-  // fallback은 최대 maxVideos만 먼저 확보
   const fallbackBase = fallback.slice(0, maxVideos);
-
-  // fresh를 뒤에 붙이기 위해, 그 개수만큼 앞에서 잘라냄
   const cutCount = freshSelected.length;
   const fallbackTrimmed = fallbackBase.slice(cutCount);
-
   const merged = [...fallbackTrimmed, ...freshSelected];
 
-  // 혹시 fallback이 부족하면 maxVideos보다 짧을 수 있음
   return merged.slice(0, maxVideos);
 }
 
@@ -337,10 +343,7 @@ async function buildOneChannel(ch, seenIdsSet) {
 
   candidates.sort((a, b) => String(b.publishedAt).localeCompare(String(a.publishedAt)));
 
-  // 최근 3일에 없던 영상
   const fresh = candidates.filter((v) => !seenIdsSet.has(v.videoId));
-
-  // 최근 3일에 있던 영상
   const fallback = candidates.filter((v) => seenIdsSet.has(v.videoId));
 
   const picked = mergeVideosWithTailFresh(fresh, fallback, maxVideos);
@@ -398,23 +401,26 @@ async function buildSchedule() {
     channels,
   };
 
-  // 오늘 사용한 videoId 기록
-  const today = todayKey();
-  history[today] = history[today] || {};
+  // 성공한 재생목록일 때만 history 갱신
+  if (hasUsableChannels(payload)) {
+    const today = todayKey();
+    history[today] = history[today] || {};
 
-  for (const ch of payload.channels) {
-    history[today][ch.name] = (ch.videos || []).map((v) => v.videoId).filter(Boolean);
+    for (const ch of payload.channels) {
+      history[today][ch.name] = (ch.videos || [])
+        .map((v) => v.videoId)
+        .filter(Boolean);
+    }
+
+    const keepDays = 30;
+    const allDays = Object.keys(history).sort();
+    const cutoffIndex = Math.max(0, allDays.length - keepDays);
+    for (let i = 0; i < cutoffIndex; i++) {
+      delete history[allDays[i]];
+    }
+
+    await setHistory(history);
   }
-
-  // 최근 30일만 유지
-  const keepDays = 30;
-  const allDays = Object.keys(history).sort();
-  const cutoffIndex = Math.max(0, allDays.length - keepDays);
-  for (let i = 0; i < cutoffIndex; i++) {
-    delete history[allDays[i]];
-  }
-
-  await setHistory(history);
 
   return payload;
 }
@@ -426,7 +432,7 @@ async function waitForExistingBuildResult() {
   const start = Date.now();
 
   while (Date.now() - start < WAIT_FOR_CACHE_MS) {
-    const cached = await getCache();
+    const cached = await getTodayCache();
 
     if (
       cached?.dayKey === todayKey() &&
@@ -447,6 +453,52 @@ async function waitForExistingBuildResult() {
   return null;
 }
 
+async function buildAndSaveOnlyIfUsable() {
+  const fresh = await buildSchedule();
+
+  // 1순위: 기존 성공 캐시 보호
+  // 2순위: 빈 재생목록 저장 금지
+  if (!hasUsableChannels(fresh)) {
+    throw new Error("Generated schedule is empty. Refusing to overwrite existing good cache.");
+  }
+
+  await setTodayCache(fresh);
+  await setLastGoodCache(fresh);
+
+  return fresh;
+}
+
+async function getBestAvailableCache() {
+  const todayCache = await getTodayCache();
+  if (
+    todayCache?.dayKey === todayKey() &&
+    Array.isArray(todayCache?.channels) &&
+    todayCache.channels.length > 0
+  ) {
+    return {
+      source: "today",
+      payload: todayCache,
+    };
+  }
+
+  const lastGood = await getLastGoodCache();
+  if (
+    lastGood &&
+    Array.isArray(lastGood?.channels) &&
+    lastGood.channels.length > 0
+  ) {
+    return {
+      source: "lastGood",
+      payload: lastGood,
+    };
+  }
+
+  return {
+    source: null,
+    payload: null,
+  };
+}
+
 // ----------------------------
 // 라우트
 // ----------------------------
@@ -456,14 +508,22 @@ app.get("/", (req, res) => {
 
 app.get("/daykey", async (req, res) => {
   try {
-    const cached = await getCache();
+    const todayCache = await getTodayCache();
+    const lastGood = await getLastGoodCache();
     const quotaUsed = await getQuotaUsed(todayKey());
 
     return res.json({
       today: todayKey(),
-      cachedDayKey: cached?.dayKey ?? null,
-      hasTodayCache: cached?.dayKey === todayKey(),
-      hasChannels: Array.isArray(cached?.channels) && cached.channels.length > 0,
+      hasTodayCache:
+        todayCache?.dayKey === todayKey() &&
+        Array.isArray(todayCache?.channels) &&
+        todayCache.channels.length > 0,
+      hasLastGoodCache:
+        !!lastGood &&
+        Array.isArray(lastGood?.channels) &&
+        lastGood.channels.length > 0,
+      todayCacheDayKey: todayCache?.dayKey ?? null,
+      lastGoodDayKey: lastGood?.dayKey ?? null,
       quotaUsedByServerToday: quotaUsed,
       quotaSafeLimit: DAILY_QUOTA_SAFE_LIMIT,
       quotaHardLimit: DAILY_QUOTA_LIMIT,
@@ -482,17 +542,19 @@ app.get("/channels", async (req, res) => {
       });
     }
 
-    // 1) 오늘 캐시가 있으면 무조건 사용
-    const cached = await getCache();
-    if (
-      cached?.dayKey === todayKey() &&
-      Array.isArray(cached?.channels) &&
-      cached.channels.length > 0
-    ) {
-      return res.json({ ...cached, cached: true });
+    // 먼저 가장 좋은 캐시를 찾음
+    const best = await getBestAvailableCache();
+
+    // 오늘 캐시가 있으면 무조건 사용
+    if (best.source === "today") {
+      return res.json({
+        ...best.payload,
+        cached: true,
+        cacheSource: "today",
+      });
     }
 
-    // 2) 이미 누군가 생성 중이면 기다림
+    // 이미 누군가 생성 중이면 기다림
     const locked = await isBuildLocked();
     if (locked) {
       const waited = await waitForExistingBuildResult();
@@ -502,7 +564,23 @@ app.get("/channels", async (req, res) => {
         Array.isArray(waited?.channels) &&
         waited.channels.length > 0
       ) {
-        return res.json({ ...waited, cached: true, waitedForBuild: true });
+        return res.json({
+          ...waited,
+          cached: true,
+          cacheSource: "today",
+          waitedForBuild: true,
+        });
+      }
+
+      // 기다려도 오늘 캐시가 안 생기면 lastGood라도 줌
+      if (best.source === "lastGood") {
+        return res.json({
+          ...best.payload,
+          cached: true,
+          stale: true,
+          cacheSource: "lastGood",
+          staleReason: "Build in progress, using previous successful playlist.",
+        });
       }
 
       return res.status(503).json({
@@ -510,7 +588,7 @@ app.get("/channels", async (req, res) => {
       });
     }
 
-    // 3) 락 획득
+    // 락 획득 시도
     const acquired = await tryAcquireBuildLock();
     if (!acquired) {
       const waited = await waitForExistingBuildResult();
@@ -520,7 +598,22 @@ app.get("/channels", async (req, res) => {
         Array.isArray(waited?.channels) &&
         waited.channels.length > 0
       ) {
-        return res.json({ ...waited, cached: true, waitedForBuild: true });
+        return res.json({
+          ...waited,
+          cached: true,
+          cacheSource: "today",
+          waitedForBuild: true,
+        });
+      }
+
+      if (best.source === "lastGood") {
+        return res.json({
+          ...best.payload,
+          cached: true,
+          stale: true,
+          cacheSource: "lastGood",
+          staleReason: "Lock contention, using previous successful playlist.",
+        });
       }
 
       return res.status(503).json({
@@ -529,15 +622,52 @@ app.get("/channels", async (req, res) => {
     }
 
     try {
-      // 4) 오늘 캐시가 없을 때만 생성
-      const fresh = await buildSchedule();
-      await setCache(fresh);
+      // 3순위: quota 부족 시 새 생성 중단 + 기존 캐시 반환
+      const fresh = await buildAndSaveOnlyIfUsable();
 
-      return res.json({ ...fresh, cached: false });
+      return res.json({
+        ...fresh,
+        cached: false,
+        cacheSource: "newlyBuilt",
+      });
+    } catch (e) {
+      const fallback = await getLastGoodCache();
+
+      if (
+        fallback &&
+        Array.isArray(fallback?.channels) &&
+        fallback.channels.length > 0
+      ) {
+        return res.json({
+          ...fallback,
+          cached: true,
+          stale: true,
+          cacheSource: "lastGood",
+          staleReason: String(e),
+        });
+      }
+
+      return res.status(500).json({ error: String(e) });
     } finally {
       await releaseBuildLock();
     }
   } catch (e) {
+    const fallback = await getLastGoodCache();
+
+    if (
+      fallback &&
+      Array.isArray(fallback?.channels) &&
+      fallback.channels.length > 0
+    ) {
+      return res.json({
+        ...fallback,
+        cached: true,
+        stale: true,
+        cacheSource: "lastGood",
+        staleReason: String(e),
+      });
+    }
+
     return res.status(500).json({ error: String(e) });
   }
 });
